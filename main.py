@@ -1,95 +1,133 @@
-# 使用 vllm,使用方式见GitHub vllm
-#这是我的服务器启动
-# vllm serve /mnt/home/user04/CCL/model/Qwen2.5-7B-Instruct  --served-model-name qwen2.5-7b   --max_model_len 20000 
 import os
 import json
-from openai import OpenAI
-from tqdm import tqdm
 import re
-
-# 设置 HTTP 代理
-openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8000/v1"
-client = OpenAI(
-    base_url=openai_api_base,
-    api_key=openai_api_key
+import torch
+from tqdm import tqdm
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
 )
 
-# vLLM 服务未启动时，这里会抛连接错误；做个最小的友好提示，避免直接 traceback
-try:
-    models = client.models.list()
-    model = models.data[0].id
-    print(model)
-except Exception as e:
-    raise SystemExit(
-        "无法连接到本地 vLLM(OpenAI 兼容) 服务：" + openai_api_base + "\n"
-        "请先启动 vllm serve，然后再运行本脚本。原始错误：" + str(e)
-    )
+# =========================
+# 0. 基本环境设置（可选但推荐）
+# =========================
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
+# =========================
+# 1. 本地模型路径（改成你自己的）
+# =========================
+MODEL_PATH = "/home/greenmuffin/Repos/PythonProjects/Poetry/models/Qwen/Qwen2.5-7B-Instruct"
+
+# =========================
+# 2. 加载 tokenizer
+# =========================
+print("Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_PATH,
+    trust_remote_code=True
+)
+
+# =========================
+# 3. 4bit 量化配置（关键）
+# =========================
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+# =========================
+# 4. 加载模型（强制整个模型进 GPU）
+# =========================
+print("Loading model (4bit, GPU only)...")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH,
+    trust_remote_code=True,
+    quantization_config=bnb_config,
+    device_map={"": 0},          # 强制全部放到 GPU 0
+    max_memory={0: "5.8GB"},     # 给系统留一点显存余量
+    low_cpu_mem_usage=True
+)
+
+model.eval()
+print("Model loaded.")
+
+# =========================
+# 5. 推理函数
+# =========================
 def get_response(data):
     prompt = f"""
-        你是一个古诗词专家，现在有一些古诗词需要你的帮助。
-        我会给你提供一个 JSON 数据，格式如下：
-        - **"index"**：古诗词的序号
-        - **"title"**：古诗词的标题
-        - **"author"**：古诗词的作者
-        - **"content"**：古诗词的内容
-        - **"qa_words"**：古诗词中需要翻译的词语
-        - **"qa_sents"**：古诗词中需要提供白话文译文的句子
-        - **"choose"**：一个包含多个选项的字典，每个选项代表该诗词可能表达的情感
+你是一个古诗词专家，现在有一些古诗词需要你的帮助。
 
-        这是我的数据：{data}
+我会给你提供一个 JSON 数据，格式如下：
+- "index"：古诗词的序号
+- "title"：古诗词的标题
+- "author"：古诗词的作者
+- "content"：古诗词的内容
+- "qa_words"：古诗词中需要翻译的词语
+- "qa_sents"：古诗词中需要提供白话文译文的句子
+- "choose"：一个包含多个选项的字典，每个选项代表该诗词可能表达的情感
 
-        ### 你的任务：
-        请你根据提供的数据，生成如下 JSON 格式的结果：
-        - **"ans_qa_words"**：对 "qa_words" 词语的含义进行解释
-        - **"ans_qa_sents"**：对 "qa_sents" 句子提供白话文译文
-        - **"choose_id"**：从 "choose" 选项中选择最符合该古诗词情感的标号，仅输出对应的字母
+这是我的数据：
+{data}
 
-        ### **json输出格式示例：**
+### 你的任务：
+请你根据提供的数据，生成如下 JSON 格式的结果：
+- "ans_qa_words"
+- "ans_qa_sents"
+- "choose_id"
 
-        {{
-            "idx": 古诗词的序号,
-            "ans_qa_words": {{
-                "词语1": "词语1的含义",
-                "词语2": "词语2的含义",
-                "词语3": "词语3的含义"
-            }},
-            "ans_qa_sents": {{
-                "句子1": "句子1的白话文翻译",
-                "句子2": "句子2的白话文翻译"
-            }},
-            "choose_id": ""
-        }}
+### JSON 输出示例：
+{{
+  "idx": {data.get("index", "")},
+  "ans_qa_words": {{}},
+  "ans_qa_sents": {{}},
+  "choose_id": ""
+}}
 
-        ### **注意事项：**
-        1. **仅返回 JSON 结果，不需要额外解释或输出其他内容。**
-        2. **请确保 "choose_id" 只输出选项的字母，不要附加其他文本。**
-        3. **请保持输出格式整洁，符合 JSON 规范。**
-        4.**不要给出任何注释和注意，只需要给出答案，不需要给出其他无关内容**
-        5.**请确保输出格式整洁，符合 JSON 规范。**
-        6.**必须用中文解答。**
-    """
-    for _ in range(3):  # 三次重传机制
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                stream=False
+注意：
+1. 只输出 JSON
+2. 不要输出任何多余文本
+3. 必须是合法 JSON
+4. 必须使用中文
+"""
+
+    try:
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=False,
+                temperature=0.0,
+                repetition_penalty=1.1
             )
-            content = response.choices[0].message.content.strip()
-            # 使用正则提取 JSON 格式的内容（匹配 { } 之间的内容）
-            match = re.search(r'\{.*\}', content, re.DOTALL)
-            if match:
-                answer = match.group(0)  # 获取匹配的 JSON 字符串
-                answer = answer.strip()  # 去除前后空格
-                answer = json.loads(answer)
-                return answer
-        except json.JSONDecodeError:
-            continue
-        except Exception:
-            # 连接失败/超时等：本条直接走兜底输出
-            break
+
+        text = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[-1]:],
+            skip_special_tokens=True
+        ).strip()
+
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+
+    except Exception as e:
+        print("推理失败：", e)
+
+    finally:
+        # 防止显存碎片化
+        torch.cuda.empty_cache()
+
     return {
         "idx": data.get("index", data.get("idx", "")),
         "ans_qa_words": {},
@@ -97,14 +135,12 @@ def get_response(data):
         "choose_id": ""
     }
 
-
+# =========================
+# 6. 主流程
+# =========================
 def main():
-    # 读取输入数据
-    # 产出提交文件（按竞赛要求命名 submit.json）
-    output_path = "submit.json"
-
-    # 递归遍历 train-data 下所有 json 文件，逐个 open + json.load 合并
     input_path = "data/train-data"
+    output_path = "submit.json"
 
     json_files = []
     for root, _, files in os.walk(input_path):
@@ -123,18 +159,15 @@ def main():
             input_data.append(data)
 
     output_data = []
+
     for i, data in enumerate(tqdm(input_data, desc="Processing")):
-        # 兼容 idx/index 都可能出现；都没有就用合并后顺序编号
         if "index" not in data and "idx" not in data:
             data = dict(data)
             data["index"] = i
 
         answer = get_response(data)
-        if not answer:
-            continue
 
-        # 强制成提交格式
-        idx = answer.get("idx", data.get("index", data.get("idx", i)))
+        idx = answer.get("idx", data.get("index", i))
         output_data.append(
             {
                 "idx": idx,
@@ -144,12 +177,13 @@ def main():
             }
         )
 
-    # 写入输出文件
-    with open(output_path, 'w', encoding='utf-8') as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=4)
 
-    print(f"处理完成。共处理 {len(output_data)} 条数据，输出已保存到 {output_path}。")
+    print(f"处理完成：共 {len(output_data)} 条，已保存到 {output_path}")
 
-
+# =========================
+# 7. 程序入口
+# =========================
 if __name__ == "__main__":
     main()
