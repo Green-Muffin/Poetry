@@ -1,3 +1,20 @@
+"""诗词理解与推理评测主方案脚本。
+
+该脚本实现了比 `baseline.py` 更强的基线，主要组合了：
+- 轻量级检索（token 重叠 + IDF）覆盖 `data/train-data/**/train.json` 下的全部训练切分；
+- 从训练集中挖掘全局的“词语 -> 释义”字典，用于高置信度的词语释义；
+- 将任务拆成三段 LLM 调用，降低子任务之间的相互干扰：
+    1）词语释义（ans_qa_words）
+    2）句子翻译（ans_qa_sents）
+    3）情感选择（映射到 A/B/C/D 的 choose_id）
+
+推理服务需要是 OpenAI 兼容接口（例如本地 vLLM 服务）。代码通过重试与 JSON
+抽取来提高对异常返回的鲁棒性。
+
+输出：
+    按要求写出 `submit.json`。
+"""
+
 # 使用 vllm,使用方式见GitHub vllm
 # 这是我的服务器启动
 # vllm serve /mnt/home/user04/CCL/model/Qwen2.5-7B-Instruct  --served-model-name qwen2.5-7b   --max_model_len 20000
@@ -36,6 +53,17 @@ TRANS_FEWSHOT_MIN_SCORE = 1.20  # 归一化后的 overlap-idf 分数阈值
 
 
 def _extract_json(text: str):
+    """从模型输出中提取第一个 JSON 对象。
+
+    模型有时会把 JSON 包在 Markdown 代码块中，或在前后附加一些文本。
+    本函数会先去掉常见的代码块包裹，再用正则匹配第一个 `{...}` 并尝试解析。
+
+    参数：
+        text：模型原始输出文本。
+
+    返回：
+        dict | None：解析成功返回字典；否则返回 None。
+    """
     text = (text or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
@@ -49,6 +77,19 @@ def _extract_json(text: str):
 
 
 def _call_llm(prompt: str, max_retries: int = 3):
+    """调用聊天接口并带重试。
+
+    参数：
+        prompt：用户提示词。
+        max_retries：请求失败时的重试次数。
+
+    返回：
+        str：模型返回的原始文本（可能为空）。
+
+    说明：
+        - 为了批量推理不中断，这里刻意捕获了较宽泛的异常；
+        - temperature 设为 0.0 以获得更稳定的输出。
+    """
     last_text = ""
     for _ in range(max_retries):
         try:
@@ -67,6 +108,7 @@ def _call_llm(prompt: str, max_retries: int = 3):
 
 
 def _tokenize(text: str):
+    """为检索任务对中文文本做简单分词（单字 + 相邻双字）。"""
     # 简单中文 token：单字 + 相邻双字（更利于相似检索）
     text = re.sub(r"\s+", "", str(text))
     chars = [c for c in text if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]
@@ -78,6 +120,11 @@ def _tokenize(text: str):
 
 
 def _load_train_examples(train_root: str = "data/train-data"):
+    """遍历 `train_root` 并加载其中所有 `train.json`。
+
+    返回：
+        list[dict]：汇总后的训练样本列表。
+    """
     examples = []
     for root, _, files in os.walk(train_root):
         for name in files:
@@ -94,6 +141,7 @@ def _load_train_examples(train_root: str = "data/train-data"):
 
 
 def _build_retriever(train_examples):
+    """构建检索索引（每条样本的 token 集合 + 全局 IDF 权重）。"""
     # 轻量检索：idf(重叠 token) 求和
     doc_tokens = []
     df = Counter()
@@ -114,6 +162,11 @@ def _build_retriever(train_examples):
 
 
 def _ensure_fewshot_loaded():
+    """按需（懒加载）初始化检索索引与全局词语释义字典。
+
+    副作用：
+        会填充全局变量 TRAIN_EXAMPLES / TRAIN_DOC_TOKENS / TRAIN_IDF / TRAIN_KEYWORD_DICT。
+    """
     global TRAIN_EXAMPLES, TRAIN_DOC_TOKENS, TRAIN_IDF, TRAIN_KEYWORD_DICT
     if TRAIN_EXAMPLES is not None and TRAIN_KEYWORD_DICT is not None:
         return
@@ -145,6 +198,7 @@ def _ensure_fewshot_loaded():
 
 
 def _topk_examples(query_text: str, train_examples, doc_tokens, idf, k: int = 3):
+    """返回 top-k 相似样本（未归一化的 overlap-idf 分数）。"""
     q = set(_tokenize(query_text))
     scored = []
     for i, dt in enumerate(doc_tokens):
@@ -163,7 +217,20 @@ def _topk_examples(query_text: str, train_examples, doc_tokens, idf, k: int = 3)
 
 
 def _topk_examples_scored(query_text: str, train_examples, doc_tokens, idf, k: int = 3):
-    """返回 (score, example) 列表，score 为归一化 overlap-idf 分数。"""
+    """返回 top-k 相似样本，并给出归一化分数。
+
+    归一化方式：用 raw overlap-idf 除以查询 token 数，以避免过长输入占优。
+
+    参数：
+        query_text：查询文本。
+        train_examples：训练样本。
+        doc_tokens：训练样本的 token 集合。
+        idf：token -> idf 权重。
+        k：Top-K。
+
+    返回：
+        list[tuple[float, dict]]：(score, example) 列表。
+    """
     q = set(_tokenize(query_text))
     denom = max(len(q), 1)
     scored = []
@@ -184,9 +251,17 @@ def _topk_examples_scored(query_text: str, train_examples, doc_tokens, idf, k: i
 
 
 def _format_fewshot_block(examples, mode: str):
-    """mode: 'words' | 'sents'
+    """把 few-shot 示例格式化为提示词块。
 
-    经验：full few-shot 很容易带偏；这里按任务选择性放字段，降低噪声。
+    参数：
+        examples：检索到的示例。
+        mode：'words' 或 'sents'。不同任务只保留不同字段以降低噪声。
+
+    返回：
+        str：可插入到提示词中的文本块。
+
+    说明：
+        few-shot 很容易把输出带偏，因此这里会按任务选择性地放字段。
     """
     if not examples:
         return ""
@@ -215,6 +290,20 @@ def _format_fewshot_block(examples, mode: str):
 
 
 def get_response(data):
+    """为单条评测样本生成完整提交结果（词语/句子/情感）。
+
+    该函数刻意做了较强的“兜底/防御式”处理：
+    - 优先使用高置信度的训练集词典释义；
+    - 仅对缺失项调用模型；
+    - 对空输出进行二次补全；
+    - 保证所有必需字段与 key 都存在且为非空。
+
+    参数：
+        data (dict)：评测样本。
+
+    返回：
+        dict：单条提交结果。
+    """
     # few-shot：从训练集中检索相似示例，作为风格参考
     _ensure_fewshot_loaded()
 
@@ -501,6 +590,7 @@ content：{data.get('content', '')}
 
 
 def main():
+    """批量推理入口：读取评测 JSON，写出 submit.json。"""
     # 读取输入数据
     output_path = "submit.json"
     input_path = "data/eval_data.json"

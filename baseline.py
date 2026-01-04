@@ -1,3 +1,27 @@
+"""诗词理解与推理评测 Baseline 脚本。
+
+本文件实现一个最小可用的端到端流程：
+1）从 JSON 文件读取评测样本；
+2）将每条样本发送到 OpenAI 兼容的 Chat 接口（通常由 vLLM 提供服务）；
+3）将模型输出解析为 JSON；
+4）把结果保存到 `submit.json`。
+
+说明：
+- 推理服务需要是 OpenAI 兼容接口（例如：`vllm serve ... --port 8000`）。
+- 该 baseline 更关注 IO 格式正确性，而非最优分数。
+
+输出格式（submit.json）：
+    [
+        {
+            "idx": int,
+            "ans_qa_words": {"word": "meaning", ...},
+            "ans_qa_sents": {"sentence": "translation", ...},
+            "choose_id": "A"|"B"|"C"|"D"
+        },
+        ...
+    ]
+"""
+
 # 使用 vllm,使用方式见GitHub vllm
 # 这是我的服务器启动
 # vllm serve /mnt/home/user04/CCL/model/Qwen2.5-7B-Instruct  --served-model-name qwen2.5-7b   --max_model_len 20000
@@ -20,6 +44,19 @@ print(model)
 
 
 def get_response(data):
+    """针对单条评测样本请求模型并解析结果。
+
+    参数：
+        data (dict)：一条评测样本。常见字段包括 `index`/`idx`、`title`、`author`、`content`、
+            `qa_words`、`qa_sents`、`choose`。
+
+    返回：
+        dict：从模型输出中解析得到的 JSON 字典；若解析失败，则返回一个字段为空的默认字典。
+
+    行为：
+        - 最多重试 3 次；
+        - 从模型输出中提取第一个形如 `{...}` 的 JSON 对象进行解析。
+    """
     prompt = f"""
         你是一个古诗词专家，现在有一些古诗词需要你的帮助。
         我会给你提供一个 JSON 数据，格式如下：
@@ -89,6 +126,7 @@ def get_response(data):
 
 
 def main():
+    """运行 baseline：读取 `data/eval_data.json`，生成并写出 `submit.json`。"""
     # 读取输入数据
     output_path = "submit.json"
     input_path = "data/eval_data.json"

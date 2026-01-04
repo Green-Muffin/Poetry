@@ -1,3 +1,22 @@
+"""诗词理解与推理评测 Few-shot Baseline 脚本。
+
+本脚本会请求一个 OpenAI 兼容的聊天接口（通常是本地 vLLM 服务），生成以下内容：
+- `qa_words` 的词语解释（ans_qa_words）
+- `qa_sents` 的句子白话翻译（ans_qa_sents）
+- 情感选项（choose_id，A/B/C/D）
+
+Few-shot 部分会从训练集（`data/train-data/**/train.json`）中检索 K 条相似样本。
+检索方法为轻量级的 token 重叠 + IDF 打分，然后把这些示例的关键字段以紧凑形式拼进提示词。
+
+运行方式（示例）：
+    1）启动 vLLM 的 OpenAI 兼容服务：
+       `vllm serve /path/to/Qwen2.5-7B-Instruct --served-model-name qwen2.5-7b --max_model_len 20000`
+    2）运行本脚本生成 `submit.json`。
+
+重要说明：
+- 文件名包含连字符（`few-shot.py`），按脚本方式执行即可，不建议作为模块被 import。
+"""
+
 # 使用 vllm,使用方式见GitHub vllm
 # 这是我的服务器启动
 # vllm serve /mnt/home/user04/CCL/model/Qwen2.5-7B-Instruct  --served-model-name qwen2.5-7b   --max_model_len 20000
@@ -28,6 +47,19 @@ TRAIN_IDF = None
 
 
 def _tokenize(text: str):
+    """为检索任务对中文文本做简单分词。
+
+    策略：
+        - 去除空白符；
+        - 保留中文字符与字母数字；
+        - 同时输出单字（unigram）与相邻双字（bigram）。
+
+    参数：
+        text：输入文本。
+
+    返回：
+        list[str]：token 列表。
+    """
     # 简单中文 token：单字 + 相邻双字（更利于相似检索）
     text = re.sub(r"\s+", "", str(text))
     chars = [c for c in text if ("\u4e00" <= c <= "\u9fff") or c.isalnum()]
@@ -39,6 +71,17 @@ def _tokenize(text: str):
 
 
 def _load_train_examples(train_root: str = "data/train-data"):
+    """递归扫描训练目录并加载训练样本。
+
+    仓库中训练数据按类别存放在 `data/train-data/` 下，每个子目录包含一个 `train.json`。
+    本函数会递归查找所有名为 `train.json` 的文件并汇总样本。
+
+    参数：
+        train_root：训练数据根目录。
+
+    返回：
+        list[dict]：训练样本列表。
+    """
     examples = []
     for root, _, files in os.walk(train_root):
         for name in files:
@@ -55,6 +98,19 @@ def _load_train_examples(train_root: str = "data/train-data"):
 
 
 def _build_retriever(train_examples):
+    """构建轻量级的 IDF 检索器索引。
+
+    对每条训练样本，基于 (title, author, content) 构造 token 集合。
+    对查询文本的打分为：与文档 token 的重叠部分的 IDF 权重之和。
+
+    参数：
+        train_examples（list[dict]）：训练样本。
+
+    返回：
+        tuple[list[set[str]], dict[str, float]]：
+            - doc_tokens：每条训练样本对应的 token 集合
+            - idf：token -> idf 权重
+    """
     # 轻量检索：idf(重叠 token) 求和
     doc_tokens = []
     df = Counter()
@@ -75,6 +131,7 @@ def _build_retriever(train_examples):
 
 
 def _ensure_fewshot_loaded():
+    """按需（懒加载）初始化并缓存训练样本与检索索引。"""
     global TRAIN_EXAMPLES, TRAIN_DOC_TOKENS, TRAIN_IDF
     if TRAIN_EXAMPLES is not None:
         return
@@ -84,6 +141,7 @@ def _ensure_fewshot_loaded():
 
 
 def _topk_examples(query_text: str, train_examples, doc_tokens, idf, k: int = 3):
+    """返回用于 few-shot 提示的 top-k 相似训练样本。"""
     q = set(_tokenize(query_text))
     scored = []
     for i, dt in enumerate(doc_tokens):
@@ -102,6 +160,7 @@ def _topk_examples(query_text: str, train_examples, doc_tokens, idf, k: int = 3)
 
 
 def _format_fewshot_block(examples):
+    """把检索到的示例格式化为紧凑的 few-shot 提示块。"""
     if not examples:
         return ""
     lines = []
@@ -129,6 +188,22 @@ def _format_fewshot_block(examples):
 
 
 def get_response(data):
+    """为单条评测样本生成答案。
+
+    参数：
+        data (dict)：评测样本。
+
+    返回：
+        dict：符合提交要求的字典，包含：
+            - idx
+            - ans_qa_words
+            - ans_qa_sents
+            - choose_id
+
+    说明：
+        - 通过提示词强约束模型只输出 JSON；
+        - 内置重试机制，并从输出中提取第一个 JSON 对象。
+    """
     # few-shot：从训练集中检索相似示例，作为风格参考
     _ensure_fewshot_loaded()
     query_text = "\n".join(
@@ -235,6 +310,7 @@ C. 情感选择（choose_id）
 
 
 def main():
+    """程序入口：读取评测数据，逐条处理并写出 `submit.json`。"""
     # 读取输入数据
     output_path = "submit.json"
     input_path = "data/eval_data.json"
